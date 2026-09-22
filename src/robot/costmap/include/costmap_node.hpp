@@ -16,6 +16,7 @@ class CostmapNode : public rclcpp::Node {
  
   private:
     robot::CostmapCore costmap_;
+    double inflation_radius_;
     // Place these constructs here
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr lidar_sub_;
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_pub_;
