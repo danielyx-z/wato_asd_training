@@ -16,7 +16,7 @@
 ##   - samples          :   starts up sample nodes for reference
 
 ACTIVE_MODULES="robot gazebo vis_tools"
-
+FOXGLOVE_BRIDGE_PORT=8765
 ################################# MODE OF OPERATION #################################
 ## Possible modes of operation when running watod.
 ## Possible values:
