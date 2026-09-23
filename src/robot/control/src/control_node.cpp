@@ -19,7 +19,7 @@ public:
         // Control Parameters
         lookahead_distance_ = 0.8;  // Lookahead distance L (meters)
         goal_tolerance_ = 0.25;     // Stop distance threshold from final waypoint (meters)
-        linear_speed_ = 0.4;       // Forward linear velocity (m/s)
+        linear_speed_ = 1;       // Forward linear velocity (m/s)
         max_angular_vel_ = 1.5;     // Maximum allowed rotation speed (rad/s)
         // Beyond this bearing to the lookahead point the pure pursuit curvature is
         // useless, so turn on the spot until the target is back in front. 1.0 rad
