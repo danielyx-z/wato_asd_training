@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <memory>
@@ -20,6 +21,11 @@ public:
         goal_tolerance_ = 0.25;     // Stop distance threshold from final waypoint (meters)
         linear_speed_ = 0.4;       // Forward linear velocity (m/s)
         max_angular_vel_ = 1.5;     // Maximum allowed rotation speed (rad/s)
+        // Beyond this bearing to the lookahead point the pure pursuit curvature is
+        // useless, so turn on the spot until the target is back in front. 1.0 rad
+        // (~57 deg) is wide enough that normal tracking never trips it.
+        heading_tolerance_ = 1.0;   // Bearing that forces a pivot (rad)
+        pivot_gain_ = 2.0;          // Proportional gain used while pivoting
 
         // Subscribers and Publishers
         path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
@@ -108,12 +114,27 @@ private:
         double dy = target_y - robot_y;
 
         // Rotate into local frame (x_local: forward, y_local: left)
+        double local_x =  std::cos(yaw) * dx + std::sin(yaw) * dy;
         double local_y = -std::sin(yaw) * dx + std::cos(yaw) * dy;
 
         // Actual distance L to target
         double Ld = computeDistance(robot_pose.position, target.pose.position);
 
         if (Ld < 1e-4) {
+            return cmd_vel;
+        }
+
+        // Bearing to the target, measured from straight ahead.
+        double alpha = std::atan2(local_y, local_x);
+
+        // Pure pursuit steers by y_local alone, which collapses for a target that
+        // is directly behind: y_local goes to zero there just as it does straight
+        // ahead, so the controller commands full speed and no turn and drives away
+        // from the goal. A differential drive can spin on the spot, so do that
+        // until the target is in front and the curvature law is meaningful again.
+        if (std::abs(alpha) > heading_tolerance_) {
+            cmd_vel.linear.x = 0.0;
+            cmd_vel.angular.z = std::clamp(pivot_gain_ * alpha, -max_angular_vel_, max_angular_vel_);
             return cmd_vel;
         }
 
@@ -163,6 +184,8 @@ private:
     double goal_tolerance_;
     double linear_speed_;
     double max_angular_vel_;
+    double heading_tolerance_;
+    double pivot_gain_;
 };
 
 int main(int argc, char **argv) {
