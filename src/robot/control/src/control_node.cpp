@@ -20,19 +20,9 @@ public:
         goal_tolerance_ = 0.25;     // Stop distance threshold from final waypoint (meters)
         linear_speed_ = 0.75;       // Forward linear velocity (m/s)
         max_angular_vel_ = 1.5;     // Maximum allowed rotation speed (rad/s)
-        // Lookahead distance L (meters), set as how far ahead in *time* the
-        // controller looks. This, not the speed, is what governs how much the
-        // steering wiggles. The path out of A* is an 8-connected grid staircase,
-        // so on a shallow heading it alternates straight and diagonal cells, and a
-        // short L makes the controller chase every step of that staircase instead
-        // of the line it approximates. Three seconds of preview averages the
-        // staircase out. Past about 3.5 s it starts cutting corners instead and
-        // the clearance to obstacles falls off sharply, so do not raise this much
-        // further without re-checking that.
+      
         lookahead_distance_ = std::max(0.8, 3.0 * linear_speed_);
-        // Beyond this bearing to the lookahead point the pure pursuit curvature is
-        // useless, so turn on the spot until the target is back in front. 1.0 rad
-        // (~57 deg) is wide enough that normal tracking never trips it.
+
         heading_tolerance_ = 1.0;   // Bearing that forces a pivot (rad)
         pivot_gain_ = 2.0;          // Proportional gain used while pivoting
 
