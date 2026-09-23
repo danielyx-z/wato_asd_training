@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -75,6 +76,18 @@ public:
         timer_ = this->create_wall_timer(
             std::chrono::milliseconds(500), std::bind(&PlannerNode::timerCallback, this));
 
+        // Cells at or above this cost are only crossed as a last resort. With the
+        // costmap's 2 m inflation radius, 60 keeps the path 0.8 m clear of anything
+        // solid, which a robot with a 0.5 m half-width needs to turn without clipping.
+        lethal_cost_ = this->declare_parameter<int>("lethal_cost", 60);
+        // How hard to steer away from the inflation gradient out in open space.
+        cost_weight_ = this->declare_parameter<double>("cost_weight", 10.0);
+        // Extra multiplier applied on top of that inside the lethal band.
+        lethal_penalty_ = this->declare_parameter<double>("lethal_penalty", 50.0);
+        // Plan optimistically through unexplored ground, else distant goals fail.
+        allow_unknown_ = this->declare_parameter<bool>("allow_unknown", true);
+        unknown_penalty_ = this->declare_parameter<double>("unknown_penalty", 2.0);
+
         RCLCPP_INFO(this->get_logger(), "PlannerNode initialized. Waiting for goal...");
     }
 
@@ -96,6 +109,16 @@ private:
 
     bool goal_received_ = false;
     bool odom_received_ = false;
+
+    // Planner tuning
+    int lethal_cost_ = 60;
+    double cost_weight_ = 10.0;
+    double lethal_penalty_ = 50.0;
+    bool allow_unknown_ = true;
+    double unknown_penalty_ = 2.0;
+
+    // A cell holding an actual laser return, never traversable
+    static constexpr int8_t kOccupied = 100;
 
     // ------------------- Callbacks -------------------
 
@@ -125,7 +148,8 @@ private:
                 RCLCPP_INFO(this->get_logger(), "Goal reached successfully!");
                 state_ = State::WAITING_FOR_GOAL;
             } else {
-                RCLCPP_INFO(this->get_logger(), "Periodic replan execution...");
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "Periodic replan execution...");
                 planPath();
             }
         }
@@ -160,24 +184,50 @@ private:
         wy = origin_y + (idx.y + 0.5) * resolution;
     }
 
+    bool inBounds(const CellIndex &idx) const {
+        return idx.x >= 0 && idx.x < static_cast<int>(current_map_.info.width) &&
+               idx.y >= 0 && idx.y < static_cast<int>(current_map_.info.height);
+    }
+
+    // Raw occupancy cost, or -1 for unknown / out of bounds.
+    int8_t cellCost(const CellIndex &idx) const {
+        if (!inBounds(idx)) return -1;
+        return current_map_.data[idx.y * current_map_.info.width + idx.x];
+    }
+
     bool isValidCell(const CellIndex &idx) const {
-        if (idx.x < 0 || idx.x >= static_cast<int>(current_map_.info.width) ||
-            idx.y < 0 || idx.y >= static_cast<int>(current_map_.info.height)) {
-            return false;
-        }
+        if (!inBounds(idx)) return false;
 
-        int flat_index = idx.y * current_map_.info.width + idx.x;
-        int8_t cost = current_map_.data[flat_index];
+        const int8_t cost = cellCost(idx);
+        // Unexplored ground is assumed drivable, otherwise no goal outside the
+        // area already mapped could ever be reached. The robot replans twice a
+        // second, so anything really there is found and routed around en route.
+        if (cost < 0) return allow_unknown_;
 
-        // Treat unknown (-1) or occupied (> 50) cells as impassable
-        return cost >= 0 && cost < 50;
+        // Anything the lidar actually returned from is solid.
+        return cost < kOccupied;
+    }
+
+    // Multiplier on the distance cost of stepping into a cell. Hugging a wall is
+    // legal but expensive, so A* only does it when there is genuinely no room --
+    // which is also what lets the robot escape if it starts inside the inflation.
+    double cellPenalty(const CellIndex &idx) const {
+        const int8_t cost = cellCost(idx);
+        // Mildly prefer ground already seen over guessing about unexplored ground.
+        if (cost < 0) return unknown_penalty_;
+        if (cost == 0) return 1.0;
+
+        double penalty = 1.0 + cost_weight_ * (static_cast<double>(cost) / 100.0);
+        if (cost >= lethal_cost_) penalty *= lethal_penalty_;
+        return penalty;
     }
 
     double heuristic(const CellIndex &a, const CellIndex &b) const {
-        // Euclidean distance heuristic
-        double dx = a.x - b.x;
-        double dy = a.y - b.y;
-        return std::sqrt(dx * dx + dy * dy);
+        // Octile distance: the exact cost of an unobstructed 8-connected walk, so
+        // it dominates the Euclidean estimate and expands far fewer cells.
+        const double dx = std::abs(a.x - b.x);
+        const double dy = std::abs(a.y - b.y);
+        return (dx + dy) - (2.0 - 1.41421356237) * std::min(dx, dy);
     }
 
     // ------------------- A* Algorithm Implementation -------------------
@@ -187,6 +237,8 @@ private:
             RCLCPP_WARN(this->get_logger(), "Cannot plan path: Missing map, goal, or odometry!");
             return;
         }
+
+        const auto plan_start = std::chrono::steady_clock::now();
 
         CellIndex start_idx = worldToGrid(robot_pose_.position.x, robot_pose_.position.y);
         CellIndex goal_idx = worldToGrid(goal_.point.x, goal_.point.y);
@@ -200,27 +252,46 @@ private:
             return;
         }
 
-        // Priority Queue (Open Set)
+        // The map is a fixed grid, so index scores by cell rather than hashing.
+        // The old unordered_map hash collided heavily (x ^ (y << 1) maps (2,1) and
+        // (0,0) to the same bucket), which dominated the search time.
+        const int width = static_cast<int>(current_map_.info.width);
+        const int height = static_cast<int>(current_map_.info.height);
+        const size_t cell_count = static_cast<size_t>(width) * height;
+        const auto flat = [width](const CellIndex &c) {
+            return static_cast<size_t>(c.y) * width + c.x;
+        };
+
+        constexpr double kInf = std::numeric_limits<double>::infinity();
+        std::vector<double> g_score(cell_count, kInf);
+        std::vector<int> came_from(cell_count, -1);
+        std::vector<char> closed(cell_count, 0);
+
         std::priority_queue<AStarNode, std::vector<AStarNode>, CompareF> open_set;
 
-        // Tracking scores and parents
-        std::unordered_map<CellIndex, double, CellIndexHash> g_score;
-        std::unordered_map<CellIndex, CellIndex, CellIndexHash> came_from;
-
-        g_score[start_idx] = 0.0;
+        g_score[flat(start_idx)] = 0.0;
         open_set.push(AStarNode(start_idx, heuristic(start_idx, goal_idx)));
 
         bool path_found = false;
+        size_t expanded = 0;
 
         // 8-connected grid direction offsets (dx, dy, step_cost)
         const std::vector<std::tuple<int, int, double>> neighbors = {
             { 1,  0, 1.0}, {-1,  0, 1.0}, { 0,  1, 1.0}, { 0, -1, 1.0},
-            { 1,  1, 1.414}, { 1, -1, 1.414}, {-1,  1, 1.414}, {-1, -1, 1.414}
+            { 1,  1, 1.41421356237}, { 1, -1, 1.41421356237},
+            {-1,  1, 1.41421356237}, {-1, -1, 1.41421356237}
         };
 
         while (!open_set.empty()) {
             CellIndex current = open_set.top().index;
             open_set.pop();
+
+            const size_t current_flat = flat(current);
+
+            // Stale duplicate left in the queue by an earlier, worse relaxation.
+            if (closed[current_flat]) continue;
+            closed[current_flat] = 1;
+            ++expanded;
 
             if (current == goal_idx) {
                 path_found = true;
@@ -232,13 +303,17 @@ private:
 
                 if (!isValidCell(neighbor)) continue;
 
-                double tentative_g = g_score[current] + step_cost;
+                const size_t neighbor_flat = flat(neighbor);
+                if (closed[neighbor_flat]) continue;
 
-                if (g_score.find(neighbor) == g_score.end() || tentative_g < g_score[neighbor]) {
-                    came_from[neighbor] = current;
-                    g_score[neighbor] = tentative_g;
-                    double f = tentative_g + heuristic(neighbor, goal_idx);
-                    open_set.push(AStarNode(neighbor, f));
+                // Distance travelled, scaled by how close to an obstacle it runs.
+                const double tentative_g =
+                    g_score[current_flat] + step_cost * cellPenalty(neighbor);
+
+                if (tentative_g < g_score[neighbor_flat]) {
+                    came_from[neighbor_flat] = static_cast<int>(current_flat);
+                    g_score[neighbor_flat] = tentative_g;
+                    open_set.push(AStarNode(neighbor, tentative_g + heuristic(neighbor, goal_idx)));
                 }
             }
         }
@@ -255,12 +330,10 @@ private:
         path.header.frame_id = current_map_.header.frame_id.empty() ? "map" : current_map_.header.frame_id;
 
         std::vector<CellIndex> cell_path;
-        CellIndex curr = goal_idx;
-        while (curr != start_idx) {
-            cell_path.push_back(curr);
-            curr = came_from[curr];
+        for (int curr = static_cast<int>(flat(goal_idx)); curr != -1; curr = came_from[curr]) {
+            cell_path.push_back(CellIndex(curr % width, curr / width));
+            if (curr == static_cast<int>(flat(start_idx))) break;
         }
-        cell_path.push_back(start_idx);
         std::reverse(cell_path.begin(), cell_path.end());
 
         for (const auto &idx : cell_path) {
@@ -283,7 +356,15 @@ private:
         }
 
         path_pub_->publish(path);
-        RCLCPP_INFO(this->get_logger(), "Successfully published path with %i waypoints.", static_cast<int>(path.poses.size()));
+
+        const double plan_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - plan_start).count();
+        RCLCPP_INFO(this->get_logger(),
+                    "Path %i pts in %.1f ms (%zu expanded): robot(%.2f,%.2f) -> goal(%.2f,%.2f); path ends (%.2f,%.2f)",
+                    static_cast<int>(path.poses.size()), plan_ms, expanded,
+                    robot_pose_.position.x, robot_pose_.position.y,
+                    goal_.point.x, goal_.point.y,
+                    path.poses.back().pose.position.x, path.poses.back().pose.position.y);
     }
 };
 

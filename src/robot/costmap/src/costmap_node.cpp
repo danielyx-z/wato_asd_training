@@ -7,8 +7,10 @@ CostmapNode::CostmapNode() : Node("costmap"), costmap_(robot::CostmapCore(this->
   // Step 2: 30 m x 30 m of coverage at 0.1 m/cell, every cell free to start.
   costmap_.initCostmap(0.1, 300, 300, 0);
 
-  // Safety buffer grown around each obstacle, in metres.
-  inflation_radius_ = this->declare_parameter<double>("inflation_radius", 1.0);
+  // Safety buffer grown around each obstacle, in metres. The chassis is 2.0 x 1.0 m,
+  // so the planner needs a gradient that reaches well past its half-width to have
+  // anything to steer away from.
+  inflation_radius_ = this->declare_parameter<double>("inflation_radius", 2.0);
 
   // Step 1: laser scans in, step 6: finished grid out.
   lidar_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
